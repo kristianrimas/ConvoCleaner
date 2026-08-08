@@ -5,9 +5,11 @@ A GUI tool to view and delete conversations from Claude Code and Codex.
 
 import hashlib
 import json
+import os
 import shutil
+import time
 import tkinter as tk
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -23,6 +25,8 @@ class ConvoCleanerApp:
         self.claude_projects_path = Path.home() / ".claude" / "projects"
         self.codex_sessions_path = Path.home() / ".codex" / "sessions"
         self.codex_archived_path = Path.home() / ".codex" / "archived_sessions"
+        appdata = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
+        self.desktop_sessions_path = Path(appdata) / "Claude" / "claude-code-sessions"
 
         # Data storage
         self.groups_data = {}
@@ -103,6 +107,18 @@ class ConvoCleanerApp:
             side=tk.RIGHT, padx=(0, 10)
         )
 
+        # Agent-only selection, with an age guard so a session you are still working in
+        # never has its subagent transcripts swept up. Packed right-to-left, so this
+        # reads as: [keep newer than (days)] [3] [Select [agent]].
+        ttk.Button(btn_frame, text="Select [agent]", command=self.select_agent_sessions).pack(
+            side=tk.RIGHT, padx=(0, 10)
+        )
+        self.agent_age_var = tk.StringVar(value="3")
+        ttk.Spinbox(btn_frame, from_=0, to=365, width=4, textvariable=self.agent_age_var).pack(
+            side=tk.RIGHT, padx=(0, 6)
+        )
+        ttk.Label(btn_frame, text="keep newer than (days):").pack(side=tk.RIGHT)
+
         # Status bar
         self.status_var = tk.StringVar(value="Ready")
         ttk.Label(main_frame, textvariable=self.status_var, relief=tk.SUNKEN, anchor=tk.W).pack(
@@ -122,12 +138,14 @@ class ConvoCleanerApp:
         self.tree.delete(*self.tree.get_children())
         self.groups_data = {}
         self.session_lookup = {}
+        self._cli_session_ids = set()
 
         claude_sessions, claude_size = self._load_claude_sessions()
+        desktop_sessions, desktop_size = self._load_desktop_sessions()
         codex_sessions, codex_size = self._load_codex_sessions()
 
-        total_sessions = claude_sessions + codex_sessions
-        total_size = claude_size + codex_size
+        total_sessions = claude_sessions + desktop_sessions + codex_sessions
+        total_size = claude_size + desktop_size + codex_size
         group_count = len(self.groups_data)
 
         self.stats_label.config(
@@ -178,6 +196,7 @@ class ConvoCleanerApp:
 
             for jsonl_path in sorted(jsonl_files, key=lambda p: p.stat().st_mtime, reverse=True):
                 session_filename = jsonl_path.stem
+                self._cli_session_ids.add(session_filename)
                 rel_path = jsonl_path.relative_to(project_folder)
                 session_key = str(rel_path).replace("\\", "/").replace(".jsonl", "")
                 safe_id = session_key.replace("/", "_").replace("\\", "_")
@@ -218,6 +237,91 @@ class ConvoCleanerApp:
                 self.tree.insert(
                     group_node, tk.END, iid=session_iid, text=display_name,
                     values=(summary, msg_count, created, modified, branch, "", size),
+                    tags=("session",),
+                )
+                total_sessions += 1
+
+        return total_sessions, total_size
+
+    def _load_desktop_sessions(self):
+        """Load sessions from the Claude Code desktop app storage."""
+        if not self.desktop_sessions_path.exists():
+            return 0, 0
+
+        total_sessions = 0
+        total_size = 0
+
+        # Collect all session JSON files across account/profile folders
+        session_files = list(self.desktop_sessions_path.rglob("*.json"))
+        if not session_files:
+            return 0, 0
+
+        # Group by CWD (project directory)
+        grouped = {}
+        for json_path in session_files:
+            try:
+                with open(json_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+            except (json.JSONDecodeError, IOError):
+                continue
+
+            # Skip sessions that already have CLI .jsonl files
+            cli_id = data.get("cliSessionId", "")
+            if cli_id and cli_id in self._cli_session_ids:
+                continue
+
+            cwd = data.get("cwd", data.get("originCwd", ""))
+            group_key = cwd or "Unknown"
+
+            if group_key not in grouped:
+                grouped[group_key] = []
+            grouped[group_key].append({"path": json_path, "data": data})
+
+        # Create tree nodes for each project group
+        for cwd, entries in sorted(grouped.items()):
+            entries.sort(key=lambda e: e["data"].get("lastActivityAt", 0), reverse=True)
+
+            group_iid = self._make_iid("grp", f"desktop:{cwd}")
+            display = f"[Desktop] {self._shorten_path(cwd)} ({len(entries)})"
+
+            self.groups_data[group_iid] = {
+                "source": "desktop",
+                "cwd": cwd,
+            }
+
+            group_node = self.tree.insert(
+                "", tk.END, iid=group_iid, text=display, open=False, tags=("group",)
+            )
+
+            for entry in entries:
+                json_path = entry["path"]
+                data = entry["data"]
+
+                title = data.get("title", "")
+                session_id = data.get("sessionId", json_path.stem)
+                model = data.get("model", "")
+                created = self._format_epoch_ms(data.get("createdAt"))
+                modified = self._format_epoch_ms(data.get("lastActivityAt"))
+
+                file_size = json_path.stat().st_size
+                total_size += file_size
+                size = self.format_size(file_size)
+
+                display_name = session_id
+                if len(display_name) > 20:
+                    display_name = display_name[:17] + "..."
+
+                session_iid = self._make_iid("sess", f"desktop:{json_path}")
+
+                self.session_lookup[session_iid] = {
+                    "source": "desktop",
+                    "json_path": json_path,
+                    "group_iid": group_iid,
+                }
+
+                self.tree.insert(
+                    group_node, tk.END, iid=session_iid, text=display_name,
+                    values=(title, "", created, modified, model, self._shorten_path(cwd), size),
                     tags=("session",),
                 )
                 total_sessions += 1
@@ -550,6 +654,61 @@ class ConvoCleanerApp:
                     session_ids.append(session_id)
         self.tree.selection_set(session_ids)
 
+    def select_agent_sessions(self):
+        """Select every [agent] subagent transcript older than the age guard.
+
+        These are side-channel records: the parent session stores each agent's returned
+        result inline and never references these files by path, so removing them does not
+        break resuming the parent. What is lost is the agent's internal working
+        transcript, which only matters if you want to audit how it reached a conclusion.
+
+        The guard exists because a session you are still working in may have spawned
+        agents you are not finished with. Anything modified inside the window is left
+        alone, and the count is reported so a skip is never silent.
+        """
+        try:
+            days = int(self.agent_age_var.get())
+            if days < 0:
+                raise ValueError
+        except ValueError:
+            messagebox.showwarning("Invalid value", "Keep-newer-than must be a whole number of days.")
+            return
+
+        cutoff = time.time() - days * 86400
+        matched, skipped = [], 0
+
+        for group_id in self.tree.get_children():
+            for session_id in self.tree.get_children(group_id):
+                info = self.session_lookup.get(session_id) or {}
+                # Only Claude CLI sessions have subagent transcripts.
+                if info.get("source") != "claude":
+                    continue
+                if "agent-" not in info.get("session_filename", ""):
+                    continue
+                path = info.get("jsonl_path")
+                try:
+                    if days and path and path.stat().st_mtime > cutoff:
+                        skipped += 1
+                        continue
+                except OSError:
+                    pass  # unreadable mtime: fall through and let it be selectable
+                matched.append(session_id)
+
+        self.tree.selection_set(matched)
+
+        if matched:
+            # Open the groups holding matches so the selection is visible before deleting.
+            for gid in {self.session_lookup[m]["group_iid"] for m in matched}:
+                self.tree.item(gid, open=True)
+            self.tree.see(matched[0])
+            note = f", {skipped} kept (newer than {days}d)" if skipped else ""
+            self.status_var.set(f"{len(matched)} [agent] session(s) selected{note}")
+        else:
+            self.status_var.set(
+                f"No [agent] sessions older than {days} day(s)"
+                + (f" ({skipped} kept as too recent)" if skipped else "")
+            )
+
     def expand_all(self):
         for item in self.tree.get_children():
             self.tree.item(item, open=True)
@@ -603,6 +762,17 @@ class ConvoCleanerApp:
                 continue
 
             source = info["source"]
+
+            if source == "desktop":
+                json_path = info["json_path"]
+                try:
+                    if json_path.exists():
+                        json_path.unlink()
+                    deleted_count += 1
+                except Exception as e:
+                    errors.append(f"Failed to delete {json_path.name}: {e}")
+                continue
+
             jsonl_path = info["jsonl_path"]
 
             try:
@@ -710,6 +880,15 @@ class ConvoCleanerApp:
             return dt.strftime("%Y-%m-%d")
         except (ValueError, AttributeError):
             return date_str[:10] if len(date_str) >= 10 else date_str
+
+    def _format_epoch_ms(self, epoch_ms):
+        if not epoch_ms:
+            return ""
+        try:
+            dt = datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc)
+            return dt.strftime("%Y-%m-%d")
+        except (ValueError, TypeError, OSError):
+            return ""
 
     def _get_file_size(self, path):
         if not path.exists():
