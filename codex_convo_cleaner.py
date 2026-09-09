@@ -46,7 +46,7 @@ class CodexConvoCleanerApp:
 
         ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=(0, 5))
         self.search_var = tk.StringVar()
-        self.search_var.trace("w", lambda *args: self.filter_tree())
+        self.search_var.trace_add("write", lambda *args: self.filter_tree())
         search_entry = ttk.Entry(search_frame, textvariable=self.search_var, width=44)
         search_entry.pack(side=tk.LEFT, padx=(0, 10))
 

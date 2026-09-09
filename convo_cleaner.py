@@ -6,12 +6,17 @@ A GUI tool to view and delete conversations from Claude Code and Codex.
 import hashlib
 import json
 import os
+import re
 import shutil
 import time
 import tkinter as tk
 from datetime import datetime, timezone
 from pathlib import Path
 from tkinter import messagebox, ttk
+
+# Scratchpad folders are named after the session UUID. Matching on this shape keeps the
+# sweep from touching anything in Temp\claude that is not a session folder.
+SESSION_ID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
 
 
 class ConvoCleanerApp:
@@ -27,6 +32,8 @@ class ConvoCleanerApp:
         self.codex_archived_path = Path.home() / ".codex" / "archived_sessions"
         appdata = os.environ.get("APPDATA", str(Path.home() / "AppData" / "Roaming"))
         self.desktop_sessions_path = Path(appdata) / "Claude" / "claude-code-sessions"
+        localappdata = os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+        self.scratchpad_path = Path(localappdata) / "Temp" / "claude"
 
         # Data storage
         self.groups_data = {}
@@ -54,7 +61,7 @@ class ConvoCleanerApp:
 
         ttk.Label(search_frame, text="Search:").pack(side=tk.LEFT, padx=(0, 5))
         self.search_var = tk.StringVar()
-        self.search_var.trace("w", lambda *a: self.filter_tree())
+        self.search_var.trace_add("write", lambda *a: self.filter_tree())
         ttk.Entry(search_frame, textvariable=self.search_var, width=44).pack(side=tk.LEFT, padx=(0, 10))
         ttk.Button(search_frame, text="Clear", command=lambda: self.search_var.set("")).pack(side=tk.LEFT)
 
@@ -99,6 +106,9 @@ class ConvoCleanerApp:
 
         ttk.Button(btn_frame, text="Expand All", command=self.expand_all).pack(side=tk.LEFT, padx=(0, 5))
         ttk.Button(btn_frame, text="Collapse All", command=self.collapse_all).pack(side=tk.LEFT, padx=(0, 5))
+        ttk.Button(
+            btn_frame, text="Sweep Orphan Scratchpads", command=self.sweep_orphan_scratchpads
+        ).pack(side=tk.LEFT, padx=(15, 5))
 
         self.delete_btn = ttk.Button(btn_frame, text="Delete Selected", command=self.delete_selected)
         self.delete_btn.pack(side=tk.RIGHT)
@@ -749,6 +759,7 @@ class ConvoCleanerApp:
             return
 
         deleted_count = 0
+        scratchpads_removed = 0
         errors = []
         removed_dirs = set()
 
@@ -791,6 +802,12 @@ class ConvoCleanerApp:
                         if folder.exists() and folder.is_dir():
                             removed_dirs.add(folder)
                             shutil.rmtree(folder)
+                        # Subagent transcripts share the parent session's scratchpad, so only
+                        # a top-level session deletion may remove it.
+                        if self._remove_scratchpad(
+                            info["project_folder_name"], info["session_filename"], errors
+                        ):
+                            scratchpads_removed += 1
                     proj_name = info["project_folder_name"]
                     if proj_name not in claude_by_project:
                         claude_by_project[proj_name] = []
@@ -830,15 +847,158 @@ class ConvoCleanerApp:
                             errors.append(f"Failed to update index for {proj_name}: {e}")
                     break
 
+        scratch_note = (
+            f"\nAlso removed {scratchpads_removed} temp scratchpad folder(s)."
+            if scratchpads_removed
+            else ""
+        )
+
         if errors:
             messagebox.showwarning(
                 "Partial Success",
-                f"Deleted {deleted_count} session(s)\n\nErrors:\n" + "\n".join(errors[:5]),
+                f"Deleted {deleted_count} session(s){scratch_note}\n\nErrors:\n" + "\n".join(errors[:5]),
             )
         else:
-            messagebox.showinfo("Success", f"Successfully deleted {deleted_count} session(s)")
+            messagebox.showinfo("Success", f"Successfully deleted {deleted_count} session(s){scratch_note}")
 
         self.load_all()
+
+    def _remove_scratchpad(self, project_folder_name, session_filename, errors):
+        """Delete the temp scratchpad (screenshots, scratch scripts) a session left behind.
+
+        Claude Code writes these to Temp\\claude\\<project>\\<session-id>\\ using the same
+        project-folder encoding as ~/.claude/projects, so the names map across directly.
+        """
+        scratch_dir = self.scratchpad_path / project_folder_name / session_filename
+        if not scratch_dir.is_dir():
+            return False
+        try:
+            shutil.rmtree(scratch_dir)
+        except OSError as e:
+            errors.append(f"Failed to delete scratchpad {session_filename[:12]}: {e}")
+            return False
+        self._cleanup_empty_dirs(scratch_dir.parent, self.scratchpad_path)
+        return True
+
+    def _known_session_ids(self):
+        """Every session ID that names a transcript file on disk."""
+        return {p.stem for p in self.claude_projects_path.rglob("*.jsonl")}
+
+    def _referenced_session_ids(self, candidates):
+        """Of `candidates`, the session IDs still mentioned inside some surviving transcript.
+
+        Resuming a conversation rewrites it under a new filename while the replayed messages
+        keep their original session_id, and a transcript can also cite an older session's
+        scratchpad path directly. Both cases mean the scratchpad still belongs to a
+        conversation you have, so matching on filenames alone would wrongly call it orphaned.
+        """
+        if not candidates:
+            return set()
+        # Match the JSON field, not a bare UUID: transcripts quote session IDs in ordinary
+        # text (command output, pasted paths) and those mentions must not protect a folder.
+        alternation = b"|".join(re.escape(cid.encode("utf-8")) for cid in candidates)
+        pattern = re.compile(rb'"session_?id"\s*:\s*"(' + alternation + rb')"', re.I)
+
+        found = set()
+        for path in self.claude_projects_path.rglob("*.jsonl"):
+            if len(found) == len(candidates):
+                break
+            try:
+                blob = path.read_bytes()
+            except OSError:
+                continue
+            found.update(match.decode("utf-8") for match in pattern.findall(blob))
+        return found
+
+    def sweep_orphan_scratchpads(self):
+        """Delete temp scratchpads whose conversation no longer exists."""
+        if not self.scratchpad_path.exists():
+            messagebox.showinfo("Sweep Scratchpads", f"No scratchpad folder at:\n{self.scratchpad_path}")
+            return
+
+        # Guard: with no transcripts to compare against, every scratchpad looks orphaned
+        # and the sweep would wipe the lot, including sessions still in use.
+        if not self.claude_projects_path.exists():
+            messagebox.showerror(
+                "Sweep Scratchpads",
+                f"Claude projects folder not found:\n{self.claude_projects_path}\n\nSweep aborted.",
+            )
+            return
+
+        known = self._known_session_ids()
+        if not known:
+            messagebox.showerror(
+                "Sweep Scratchpads",
+                "No session transcripts found. Refusing to sweep in case the folder is unreadable.",
+            )
+            return
+
+        # A scratchpad is created before its transcript is flushed, so treat anything touched
+        # in the last hour as live no matter what the transcript folder says.
+        cutoff = time.time() - 3600
+        candidates = []
+        for project_dir in sorted(self.scratchpad_path.iterdir()):
+            if not project_dir.is_dir():
+                continue
+            for session_dir in sorted(project_dir.iterdir()):
+                if not session_dir.is_dir() or not SESSION_ID_RE.match(session_dir.name):
+                    continue
+                if session_dir.name in known or session_dir.stat().st_mtime > cutoff:
+                    continue
+                candidates.append(session_dir)
+
+        orphans = []
+        if candidates:
+            self.status_var.set(f"Checking {len(candidates)} scratchpad(s) against transcript history...")
+            self.root.update_idletasks()
+            referenced = self._referenced_session_ids({d.name for d in candidates})
+            orphans = [d for d in candidates if d.name not in referenced]
+
+        kept = len(candidates) - len(orphans)
+        kept_note = f"\n{kept} kept: still referenced by a surviving conversation.\n" if kept else ""
+
+        if not orphans:
+            messagebox.showinfo("Sweep Scratchpads", f"No orphaned scratchpads found.\n{kept_note}")
+            self.status_var.set(f"No orphaned scratchpads found ({kept} kept as referenced)")
+            return
+
+        total = sum(self._dir_size(d) for d in orphans)
+        preview = "\n".join(f"   {d.parent.name} / {d.name[:8]}..." for d in orphans[:10])
+        if len(orphans) > 10:
+            preview += f"\n   ...and {len(orphans) - 10} more"
+
+        confirm = messagebox.askyesno(
+            "Sweep Orphan Scratchpads",
+            f"Found {len(orphans)} orphaned scratchpad folder(s) using {self.format_size(total)}:\n\n"
+            f"{preview}\n{kept_note}\n"
+            "No surviving conversation continues these sessions. Delete these temp files?\n"
+            "This action cannot be undone!",
+        )
+        if not confirm:
+            self.status_var.set(f"Sweep cancelled ({len(orphans)} orphaned scratchpad(s) found)")
+            return
+
+        removed = 0
+        errors = []
+        for session_dir in orphans:
+            try:
+                shutil.rmtree(session_dir)
+                self._cleanup_empty_dirs(session_dir.parent, self.scratchpad_path)
+                removed += 1
+            except OSError as e:
+                errors.append(f"{session_dir.name[:12]}: {e}")
+
+        if errors:
+            messagebox.showwarning(
+                "Partial Success",
+                f"Removed {removed} of {len(orphans)} scratchpad(s)\n\nErrors:\n" + "\n".join(errors[:5]),
+            )
+        else:
+            messagebox.showinfo(
+                "Success", f"Removed {removed} orphaned scratchpad(s), freeing {self.format_size(total)}"
+            )
+
+        self.status_var.set(f"Swept {removed} orphaned scratchpad(s)")
 
     def _cleanup_empty_dirs(self, start_dir, stop_dir):
         current = start_dir
@@ -894,6 +1054,12 @@ class ConvoCleanerApp:
         if not path.exists():
             return "N/A"
         return self.format_size(path.stat().st_size)
+
+    def _dir_size(self, path):
+        try:
+            return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+        except OSError:
+            return 0
 
     def format_size(self, size):
         for unit in ["B", "KB", "MB", "GB"]:
