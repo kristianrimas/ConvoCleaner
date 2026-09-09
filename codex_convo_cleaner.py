@@ -444,7 +444,7 @@ class CodexConvoCleanerApp:
             return ""
         try:
             dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            return dt.strftime("%Y-%m-%d")
+            return dt.astimezone().strftime("%Y-%m-%d")
         except (ValueError, AttributeError):
             return date_str[:10] if len(date_str) >= 10 else date_str
 

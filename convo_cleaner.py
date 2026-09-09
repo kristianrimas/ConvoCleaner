@@ -10,7 +10,7 @@ import re
 import shutil
 import time
 import tkinter as tk
-from datetime import datetime, timezone
+from datetime import datetime
 from pathlib import Path
 from tkinter import messagebox, ttk
 
@@ -1037,7 +1037,7 @@ class ConvoCleanerApp:
             return ""
         try:
             dt = datetime.fromisoformat(date_str.replace("Z", "+00:00"))
-            return dt.strftime("%Y-%m-%d")
+            return dt.astimezone().strftime("%Y-%m-%d")
         except (ValueError, AttributeError):
             return date_str[:10] if len(date_str) >= 10 else date_str
 
@@ -1045,7 +1045,7 @@ class ConvoCleanerApp:
         if not epoch_ms:
             return ""
         try:
-            dt = datetime.fromtimestamp(epoch_ms / 1000, tz=timezone.utc)
+            dt = datetime.fromtimestamp(epoch_ms / 1000)
             return dt.strftime("%Y-%m-%d")
         except (ValueError, TypeError, OSError):
             return ""
